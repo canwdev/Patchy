@@ -239,6 +239,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          # no checkout, so gh must not
+          # guess the repository from a git remote.
+          GH_REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = 'Stop'
           # A missing release makes `gh release view` exit 1 on purpose below.
@@ -269,25 +272,42 @@ jobs:
           )
           Set-Content -LiteralPath 'dist\NOTES.md' -Value $notes -Encoding utf8
 
-          gh release view $tag --json tagName *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --prerelease --target '${{ github.sha }}' `
-              --title 'Patchy web (pre-release)' --notes-file 'dist\NOTES.md'
-          } else {
-            gh release edit $tag --prerelease `
-              --title 'Patchy web (pre-release)' --notes-file 'dist\NOTES.md'
+          # gh gets GH_REPO, so it never needs a git checkout here.
+          # No param block on purpose: a simple function passes every token
+          # through verbatim, while [Parameter()] would make it an advanced
+          # function and swallow arguments that look like common parameters
+          # (-D would bind to -Debug).
+          function Invoke-Gh {
+            $output = (& gh @args 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "gh $($args -join ' ') failed (exit $LASTEXITCODE): $output"
+            }
+            return $output
           }
-          if ($LASTEXITCODE -ne 0) { throw 'gh release create/edit failed' }
 
-          gh release upload $tag "dist\$asset" 'dist\SHA256SUMS.txt' --clobber
-          if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed' }
+          $view = (& gh release view $tag --json tagName 2>&1 | Out-String).Trim()
+          $exists = $LASTEXITCODE -eq 0
+          if (-not $exists -and $view -notmatch 'not found|Not Found|HTTP 404') {
+            throw "gh release view $tag failed (exit $LASTEXITCODE): $view"
+          }
+          if ($exists) {
+            Invoke-Gh release edit $tag --prerelease --title 'Patchy web (pre-release)' --notes-file 'dist\NOTES.md' | Out-Null
+          } else {
+            Invoke-Gh release create $tag --prerelease --target '${{ github.sha }}' `
+              --title 'Patchy web (pre-release)' --notes-file 'dist\NOTES.md' | Out-Null
+          }
+
+          Invoke-Gh release upload $tag "dist\$asset" 'dist\SHA256SUMS.txt' --clobber | Out-Null
 
           # An existing tag stays where it was first created; move it so the
           # release's source link points at this build. Not fatal: the assets
           # are already published and the body names the commit.
-          gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/$tag" `
-            -f sha='${{ github.sha }}' -F force=true *> $null
-          if ($LASTEXITCODE -ne 0) { Write-Warning "could not move the $tag tag to ${{ github.sha }}" }
+          try {
+            Invoke-Gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/$tag" `
+              -f sha='${{ github.sha }}' -F force=true | Out-Null
+          } catch {
+            Write-Warning "could not move the $tag tag to ${{ github.sha }}: $_"
+          }
 
           $url = "${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
           @(

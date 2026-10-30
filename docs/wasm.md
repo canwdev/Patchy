@@ -337,7 +337,9 @@ A second job (`needs: site`) publishes a rolling pre-release: tag
 `SHA256SUMS.txt`; the tag is moved to the built commit. It runs on a push to `main`
 and on a manual run with `publish_prerelease` ticked, publishes into
 `github.repository` (a fork's own repository), and skips itself when that repository
-is the upstream one; it holds the workflow's only `contents: write` permission.
+is the upstream one; it holds the workflow's only `contents: write` permission. The
+job has no checkout (it only needs the artifact), so it sets `GH_REPO`: gh otherwise
+looks for a git remote and dies with `fatal: not a git repository`.
 `releases/latest/download/*` resolves to non-pre-releases only, and the asset names
 differ from the desktop ones, so the pre-release cannot shadow a download link. The
 live site is untouched either way: `upload-wasm-to-rtsoft.bat` stays its only path
