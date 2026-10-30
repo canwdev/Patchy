@@ -1,0 +1,300 @@
+name: Web (wasm) build (fork pre-release)
+
+# Fork-side builder for the deployable web app (docs/wasm.md, "GitHub Actions").
+# Every push to main provisions the toolchain into .deps, runs the same
+# scripts\release\build-wasm.bat the release uses, and attaches the staged site to
+# a rolling pre-release in THIS repository (github.repository), which for a fork is
+# the fork. Nothing here writes to the upstream repository: it needs no secrets, no
+# upstream token, and creates its tag and release only where it runs.
+# It never touches the live site either: rtsoft.com/patchy changes only through
+# scripts\release\upload-wasm-to-rtsoft.bat (docs/release-wasm.md).
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish_prerelease:
+        description: 'Publish the rolling web pre-release (tag web-site-latest) with the zip attached'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# A wasm build runs for hours, so a newer push supersedes an older one instead of
+# queueing behind it. The publish job serializes separately (web-prerelease).
+concurrency:
+  group: wasm-web-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SITE_DIR: build\package\wasm-site
+  PRERELEASE_TAG: web-site-latest
+
+jobs:
+  site:
+    name: Build the web app (wasm-release)
+    runs-on: windows-2022
+    outputs:
+      version: ${{ steps.site.outputs.version }}
+    # A cold run provisions ~6 GB and then compiles the whole app to wasm on 4
+    # cores; the job limit is 6 h.
+    timeout-minutes: 350
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # An Asyncify build of the whole app is CPU bound, and Defender scanning
+      # the object tree roughly doubles it. Best effort: not worth failing over.
+      - name: Exclude the workspace from Defender scanning
+        continue-on-error: true
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE
+
+      # build-wasm.bat falls back to the PATH cmake and ninja because the
+      # runner has no VS 2026 (vs-env.bat then only warns; Emscripten needs no
+      # MSVC). Fail here, clearly, when that fallback is not there.
+      - name: Check the host toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($tool in 'cmake', 'ninja', 'python', 'git', 'tar') {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is not on PATH" }
+            "$tool $(& $tool --version 2>&1 | Select-Object -First 1)"
+          }
+          Get-PSDrive C | Select-Object @{n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } }
+
+      # .deps holds emsdk (~2 GB), the Qt 6.10.3 wasm + msvc2022 host kits
+      # (~3 GB), ONNX Runtime and the pinned models. The setup scripts are
+      # idempotent and re-verify every checksum, so a stale restore is safe.
+      - name: Restore the provisioned dependency tree
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: ${{ runner.os }}-wasm-deps-${{ hashFiles('scripts/wasm/setup-emsdk.ps1', 'scripts/wasm/setup-qt-wasm.ps1', 'scripts/setup-ai-deps.ps1', 'CMakePresets.json') }}
+          restore-keys: |
+            ${{ runner.os }}-wasm-deps-
+
+      - name: Provision Emscripten
+        shell: pwsh
+        run: ./scripts/wasm/setup-emsdk.ps1
+
+      - name: Provision the Qt wasm and host kits
+        shell: pwsh
+        run: ./scripts/wasm/setup-qt-wasm.ps1
+
+      - name: Provision ONNX Runtime Web and the models
+        shell: pwsh
+        run: ./scripts/setup-ai-deps.ps1 -Web
+
+      # The release script is the single source of truth for the staged site:
+      # branding, shell-page substitution, cache tag, precompressed variants.
+      - name: Build and stage the site
+        shell: cmd
+        run: call scripts\release\build-wasm.bat
+
+      - name: Verify and zip the staged site
+        id: site
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $site = $env:SITE_DIR
+          if (-not (Test-Path -LiteralPath $site)) { throw "the staged site is missing: $site" }
+          $required = @(
+            'patchy.html', 'index.html', 'patchy.js', 'patchy.js.gz', 'patchy.wasm', 'patchy.wasm.br',
+            'patchy.data', 'qtloader.js', '.htaccess', 'NOTICE-THIRD-PARTY.md', 'libheif-COPYING.txt',
+            'patchy-logo.svg', 'favicon.ico', 'site.webmanifest'
+          )
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $site $_)) })
+          if ($missing.Count) { throw "the staged site is missing: $($missing -join ', ')" }
+          if (-not (Get-ChildItem -LiteralPath $site -Directory -Filter 'onnxruntime-web-*')) {
+            throw 'the onnxruntime-web folder was not staged'
+          }
+          foreach ($model in 'mobile_sam_image_encoder_int8.onnx', 'sam_mask_decoder_multi_int8.onnx') {
+            if (-not (Test-Path -LiteralPath (Join-Path $site "ai-models\$model"))) {
+              throw "Object Selection model not staged: $model"
+            }
+          }
+
+          $text = Get-Content -Raw -LiteralPath 'CMakeLists.txt'
+          $match = [regex]::Match($text, 'project\s*\([\s\S]*?\bVERSION\s+([0-9]+(?:\.[0-9]+){1,3})',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+          $version = if ($match.Success) { $match.Groups[1].Value } else { '0.0.0' }
+
+          # Zip it here rather than uploading the directory: upload-artifact
+          # drops dotfiles (the staged .htaccess) unless asked otherwise, and the
+          # served headers live in that file.
+          $zip = "patchy-web-site-$version.zip"
+          if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+          tar -a -c -f $zip -C $site .
+          if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+          tar -tf $zip | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'the zip could not be read back' }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "size=$('{0:N1} MB' -f ((Get-Item -LiteralPath $zip).Length / 1MB))" >> $env:GITHUB_OUTPUT
+
+      # The same server the local scripts use: it sends the COOP/COEP headers
+      # the threaded build needs, so a staging change that loses them shows up
+      # here instead of on the live site.
+      - name: Smoke-serve the staged site
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $node = & ./scripts/wasm/find-node.ps1
+          if (-not $node) { throw 'find-node.ps1 returned no node.exe' }
+          $proc = Start-Process -FilePath $node -PassThru -WindowStyle Hidden `
+            -ArgumentList 'scripts\wasm\serve.mjs', $env:SITE_DIR, '8973'
+          try {
+            $response = $null
+            foreach ($attempt in 1..40) {
+              try {
+                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:8973/patchy.html' -Method Head `
+                  -TimeoutSec 5 -UseBasicParsing
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+              if ($response) { break }
+            }
+            if (-not $response) { throw 'serve.mjs never answered' }
+            if ($response.StatusCode -ne 200) { throw "patchy.html answered $($response.StatusCode)" }
+            foreach ($name in 'Cross-Origin-Opener-Policy', 'Cross-Origin-Embedder-Policy') {
+              if (-not $response.Headers[$name]) { throw "$name is missing from the served page" }
+              "${name}: $($response.Headers[$name])"
+            }
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload the staged site
+        uses: actions/upload-artifact@v4
+        with:
+          name: patchy-web-site-${{ steps.site.outputs.version }}
+          path: ${{ steps.site.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 7
+          # The payload is already a zip.
+          compression-level: 0
+
+      - name: Write the run summary
+        shell: pwsh
+        run: |
+          $lines = @(
+            '### Web (wasm) build',
+            '',
+            '- Version: ${{ steps.site.outputs.version }}',
+            '- Artifact: `patchy-web-site-${{ steps.site.outputs.version }}` (${{ steps.site.outputs.size }})',
+            '',
+            'The zip is the staged `build\package\wasm-site` verbatim, so it also carries the tests-only `stress-harness.html` and `memsoak.js` that production uploads skip.',
+            '',
+            'Serve it with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (the staged `.htaccess` provides both for Apache). A static host that cannot send those headers cannot run the threaded build.',
+            '',
+            'The live site is unchanged: it only moves through `scripts\release\upload-wasm-to-rtsoft.bat`. The pre-release job below is the download channel.'
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $lines -Encoding utf8
+
+  # ---------------------------------------------------------------------------
+  # Pre-release channel, in this repository only. A rolling tag keeps one download
+  # URL (releases/download/web-site-latest/patchy-web-site.zip) whose asset is
+  # replaced in place, like the site's own stable filenames. The name is distinct
+  # from the desktop assets README.md and latest_version.json link to, and
+  # `releases/latest/download/*` never resolves to a pre-release, so this cannot
+  # shadow a desktop download.
+  #
+  # Fork hygiene: the tag and the release live in the fork. Sync upstream with
+  # `git push upstream main` (or a pull request), never `git push upstream --tags`,
+  # so nothing created here travels upstream.
+  # ---------------------------------------------------------------------------
+  prerelease:
+    name: Publish the web pre-release
+    needs: site
+    # Publishes in whatever repository runs this workflow. The upstream guard is
+    # belt and braces: this file is meant for a fork, and a copy of it must never
+    # create a release on SethRobinson/Patchy.
+    if: >-
+      github.repository != 'SethRobinson/Patchy' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish_prerelease))
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    # Publishing is not idempotent under a race: serialize the job.
+    concurrency:
+      group: web-prerelease
+      cancel-in-progress: false
+    steps:
+      - name: Download the staged site
+        uses: actions/download-artifact@v4
+        with:
+          name: patchy-web-site-${{ needs.site.outputs.version }}
+          path: dist
+
+      - name: Publish the rolling pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # A missing release makes `gh release view` exit 1 on purpose below.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = $env:PRERELEASE_TAG
+          $version = '${{ needs.site.outputs.version }}'
+
+          $built = @(Get-ChildItem -LiteralPath 'dist' -Filter 'patchy-web-site-*.zip')
+          if ($built.Count -ne 1) { throw "expected one built zip in dist, found $($built.Count)" }
+
+          # Permanent asset name: a later run replaces this file instead of
+          # piling up version-named copies in one release.
+          $asset = 'patchy-web-site.zip'
+          Copy-Item -LiteralPath $built[0].FullName -Destination "dist\$asset"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\$asset").Hash
+          "$hash  $asset" | Set-Content -LiteralPath 'dist\SHA256SUMS.txt' -Encoding ascii
+
+          $notes = @(
+            'Rolling pre-release build of the Patchy web app (`wasm-release`). Every run replaces the asset below.',
+            '',
+            "- Version: $version",
+            "- Commit: ${{ github.sha }}",
+            "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            '',
+            'Unzip it into a web root and serve it with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; the staged `.htaccess` supplies both for Apache. Without those headers the threaded build cannot start (SharedArrayBuffer).',
+            '',
+            'This is not the live site: rtsoft.com/patchy is deployed separately and is the copy that ships with a desktop release.'
+          )
+          Set-Content -LiteralPath 'dist\NOTES.md' -Value $notes -Encoding utf8
+
+          gh release view $tag --json tagName *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --prerelease --target '${{ github.sha }}' `
+              --title 'Patchy web (pre-release)' --notes-file 'dist\NOTES.md'
+          } else {
+            gh release edit $tag --prerelease `
+              --title 'Patchy web (pre-release)' --notes-file 'dist\NOTES.md'
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create/edit failed' }
+
+          gh release upload $tag "dist\$asset" 'dist\SHA256SUMS.txt' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed' }
+
+          # An existing tag stays where it was first created; move it so the
+          # release's source link points at this build. Not fatal: the assets
+          # are already published and the body names the commit.
+          gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/$tag" `
+            -f sha='${{ github.sha }}' -F force=true *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Warning "could not move the $tag tag to ${{ github.sha }}" }
+
+          $url = "${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
+          @(
+            '### Web pre-release published',
+            '',
+            "- Release: $url",
+            "- Asset: $asset ($('{0:N1} MB' -f ((Get-Item -LiteralPath "dist\$asset").Length / 1MB)))",
+            "- SHA-256: $hash",
+            "- Version: $version"
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8

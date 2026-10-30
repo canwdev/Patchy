@@ -319,6 +319,38 @@ File open/save in the browser, the worker threads and the blocking rules are in 
   `ui_script_canvas_window_suppresses_stop_panel`. Rule: never create a
   window while the app-modal busy panel can be up; dismiss it first.
 
+## GitHub Actions (`.github/workflows/wasm-web-build.yml`)
+
+Builds the deployable site on `windows-2022` with no secrets: `.deps` comes from
+`actions/cache`, the three provisioning scripts run (`setup-emsdk.ps1`,
+`setup-qt-wasm.ps1`, `setup-ai-deps.ps1 -Web`), then
+`scripts\release\build-wasm.bat` runs unchanged, so the staged site keeps the
+release's branding, cache tag and precompressed variants. The workflow then checks
+the staged file list, serves it through `serve.mjs` to verify the COOP/COEP headers,
+and uploads all of `build\package\wasm-site` as `patchy-web-site-<version>.zip`
+(7-day retention; verbatim, so it also holds the tests-only
+`stress-harness.html`/`memsoak.js`).
+
+A second job (`needs: site`) publishes a rolling pre-release: tag
+`web-site-latest`, notes naming the version/commit/run, and the only assets
+`patchy-web-site.zip` (permanent name, replaced in place each run) plus
+`SHA256SUMS.txt`; the tag is moved to the built commit. It runs on a push to `main`
+and on a manual run with `publish_prerelease` ticked, publishes into
+`github.repository` (a fork's own repository), and skips itself when that repository
+is the upstream one; it holds the workflow's only `contents: write` permission.
+`releases/latest/download/*` resolves to non-pre-releases only, and the asset names
+differ from the desktop ones, so the pre-release cannot shadow a download link. The
+live site is untouched either way: `upload-wasm-to-rtsoft.bat` stays its only path
+([release-wasm.md](release-wasm.md)).
+
+Runner facts: there is no VS 2026, so `vs-env.bat` only warns and the batch falls
+back to the PATH `cmake`/`ninja` (Emscripten needs no MSVC). A cold run provisions
+~6 GB of `.deps` and then runs a whole-app Asyncify build on 4 cores, which is why
+the cache key hashes the provisioning scripts and `CMakePresets.json`. Triggers: a
+push to `main` and manual dispatch, each superseding an older run on the same branch
+(cancel-in-progress). A fork pays for every push, so add a `paths:` filter when the
+runs get in the way.
+
 ## Release deployment (rtsoft.com/patchy)
 
 Batch-file details live in [release-wasm.md](release-wasm.md):
